@@ -278,6 +278,13 @@
   .mt-8 { margin-top: 8px; } .mt-12 { margin-top: 12px; } .mt-16 { margin-top: 16px; }
   .mb-0 { margin-bottom: 0; }
   .row-between { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  #batch-status {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; background: var(--primary-light);
+    color: var(--primary-dark); border-radius: var(--radius-sm);
+    margin-top: 10px; font-size: 13px;
+  }
+  .btn-danger-text { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -333,17 +340,24 @@
   <!-- ADD -->
   <section id="page-add" class="page">
     <h2 class="section mb-0">レシート・納品書から</h2>
-    <div class="card">
+    <div class="card" id="upload-card">
       <div class="btn-row">
         <button class="btn-secondary" id="btn-camera">📷 撮影</button>
         <button class="btn-secondary" id="btn-upload">📁 ファイル選択</button>
       </div>
-      <input type="file" id="file-input" accept="image/*" capture="environment" style="display:none;">
+      <div class="small-text mt-8">画像 (JPG/PNG) と PDF に対応。複数ファイルを一度に選んで一括処理もできます。</div>
+      <input type="file" id="file-input" accept="image/*" style="display:none;">
+      <div id="batch-status" style="display:none;">
+        <strong id="batch-progress-text">1 / 1 件</strong>
+        <span class="small-text" style="flex:1;">一括読み取り中</span>
+        <button type="button" class="btn-ghost" id="btn-skip-file" style="padding: 4px 10px;">スキップ ▶</button>
+        <button type="button" class="btn-ghost btn-danger-text" id="btn-cancel-batch" style="padding: 4px 10px;">中止</button>
+      </div>
       <div id="ocr-area" style="display:none; margin-top: 12px;">
         <img id="receipt-preview" class="preview" alt="レシートプレビュー">
         <div class="ocr-status" id="ocr-status" style="display:none;">
           <div class="spinner"></div>
-          <div>
+          <div style="flex: 1;">
             <div id="ocr-status-text">画像を解析しています…</div>
             <div class="loading-bar" style="margin-top: 6px;"><div id="ocr-progress"></div></div>
           </div>
@@ -528,6 +542,12 @@
 <!-- External libraries -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  if (window['pdfjsLib']) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+</script>
 
 <script>
 'use strict';
@@ -682,6 +702,9 @@ const state = {
   charts: {},
   filterCategory: null,
   searchQuery: '',
+  batchQueue: [],
+  batchTotal: 0,
+  batchIndex: 0,
 };
 
 /* ====================== Utilities ====================== */
@@ -769,14 +792,20 @@ async function init() {
   document.getElementById('btn-camera').addEventListener('click', () => {
     const f = document.getElementById('file-input');
     f.setAttribute('capture', 'environment');
+    f.removeAttribute('multiple');
+    f.setAttribute('accept', 'image/*');
     f.click();
   });
   document.getElementById('btn-upload').addEventListener('click', () => {
     const f = document.getElementById('file-input');
     f.removeAttribute('capture');
+    f.setAttribute('multiple', 'multiple');
+    f.setAttribute('accept', 'image/*,application/pdf');
     f.click();
   });
   document.getElementById('file-input').addEventListener('change', handleFileSelected);
+  document.getElementById('btn-skip-file').addEventListener('click', skipCurrentFile);
+  document.getElementById('btn-cancel-batch').addEventListener('click', cancelBatch);
 
   document.getElementById('entry-form').addEventListener('submit', handleSave);
   document.getElementById('btn-clear').addEventListener('click', clearForm);
@@ -971,10 +1000,23 @@ async function handleSave(e) {
   } else {
     data.createdAt = Date.now();
     await dbAdd('transactions', data);
-    toast('保存しました');
+    toast(state.batchQueue.length > 0 ? `保存 (${state.batchIndex}/${state.batchTotal})` : '保存しました');
   }
   state.transactions = await dbAll('transactions');
   populateStoreList();
+
+  // If in batch mode and more files remain, process next
+  if (state.batchQueue.length > 0) {
+    await processNextInBatch();
+    return;
+  }
+  // Batch finished or single mode
+  if (state.batchTotal > 1) {
+    state.batchTotal = 0;
+    state.batchIndex = 0;
+    document.getElementById('batch-status').style.display = 'none';
+    toast(`一括処理が完了しました`);
+  }
   clearForm();
   switchPage('home');
 }
@@ -1029,34 +1071,181 @@ function renderSplitRows() {
   });
 }
 
-/* ====================== OCR ====================== */
+/* ====================== OCR / File processing ====================== */
 async function handleFileSelected(e) {
-  const file = e.target.files[0];
-  if (!file) return;
+  const files = Array.from(e.target.files || []);
+  e.target.value = '';
+  if (files.length === 0) return;
 
-  // Compress to data URL ~ 1200px
-  const dataUrl = await fileToCompressedDataUrl(file, 1200, 0.85);
-  document.getElementById('entry-image').value = dataUrl;
-  document.getElementById('receipt-preview').src = dataUrl;
+  state.batchQueue = files.slice();
+  state.batchTotal = files.length;
+  state.batchIndex = 0;
+  updateBatchStatusUI();
+  await processNextInBatch();
+}
+
+function updateBatchStatusUI() {
+  const el = document.getElementById('batch-status');
+  const btnSave = document.getElementById('btn-save');
+  if (state.batchTotal <= 1) {
+    el.style.display = 'none';
+    if (!document.getElementById('entry-id').value) btnSave.textContent = '保存';
+    return;
+  }
+  el.style.display = 'flex';
+  const current = Math.max(1, Math.min(state.batchIndex, state.batchTotal));
+  document.getElementById('batch-progress-text').textContent = `${current} / ${state.batchTotal} 件`;
+  btnSave.textContent = state.batchQueue.length > 0 ? '保存して次へ ▶' : '保存 (最後)';
+}
+
+async function processNextInBatch() {
+  if (state.batchQueue.length === 0) {
+    // All done
+    state.batchTotal = 0;
+    state.batchIndex = 0;
+    document.getElementById('batch-status').style.display = 'none';
+    return;
+  }
+  const file = state.batchQueue.shift();
+  state.batchIndex++;
+  updateBatchStatusUI();
+  await processFile(file);
+}
+
+function skipCurrentFile() {
+  if (state.batchQueue.length > 0 || state.batchTotal > 0) {
+    clearForm();
+    if (state.batchQueue.length > 0) {
+      processNextInBatch();
+    } else {
+      state.batchTotal = 0;
+      state.batchIndex = 0;
+      document.getElementById('batch-status').style.display = 'none';
+      toast('スキップしました');
+    }
+  }
+}
+
+function cancelBatch() {
+  if (!confirm('一括処理を中止しますか？（保存済みのデータは残ります）')) return;
+  state.batchQueue = [];
+  state.batchTotal = 0;
+  state.batchIndex = 0;
+  document.getElementById('batch-status').style.display = 'none';
+  clearForm();
+  toast('中止しました');
+}
+
+async function processFile(file) {
+  // Reset form for the new file (preserves type segment if user already chose)
+  document.getElementById('entry-id').value = '';
+  document.getElementById('entry-image').value = '';
+  document.getElementById('entry-amount').value = '';
+  document.getElementById('entry-store').value = '';
+  document.getElementById('entry-store-category').value = '';
+  document.getElementById('entry-item-category').value = '';
+  document.getElementById('entry-memo').value = '';
+  document.getElementById('entry-date').value = today();
+  state.splitRows = [];
+  renderSplitRows();
+  document.getElementById('btn-delete').style.display = 'none';
+
+  const isPDF = (file.type === 'application/pdf') || /\.pdf$/i.test(file.name || '');
   document.getElementById('ocr-area').style.display = 'block';
   document.getElementById('ocr-status').style.display = 'flex';
   document.getElementById('ocr-raw').value = '';
-  document.getElementById('ocr-status-text').textContent = '画像を解析しています…';
   document.getElementById('ocr-progress').style.width = '0%';
 
   try {
-    const text = await runOCR(dataUrl);
-    document.getElementById('ocr-raw').value = text;
+    let imageDataUrl, ocrText;
+    if (isPDF) {
+      const r = await processPDF(file);
+      imageDataUrl = r.imageDataUrl;
+      ocrText = r.text;
+    } else {
+      document.getElementById('ocr-status-text').textContent = '画像を解析しています…';
+      imageDataUrl = await fileToCompressedDataUrl(file, 1200, 0.85);
+      document.getElementById('receipt-preview').src = imageDataUrl;
+      ocrText = await runOCR(imageDataUrl);
+    }
+    document.getElementById('entry-image').value = imageDataUrl;
+    document.getElementById('receipt-preview').src = imageDataUrl;
+    document.getElementById('ocr-raw').value = ocrText || '';
     document.getElementById('ocr-status').style.display = 'none';
-    parseOCRIntoForm(text);
-    toast('読み取りました。内容を確認してください');
+    if (ocrText) parseOCRIntoForm(ocrText);
+    if (state.batchTotal > 1) {
+      toast(`読み取りました (${state.batchIndex}/${state.batchTotal})`);
+    } else {
+      toast('読み取りました。内容を確認してください');
+    }
   } catch (err) {
     document.getElementById('ocr-status').style.display = 'none';
-    toast('OCRに失敗しました: ' + err.message);
+    toast('読み取り失敗: ' + (err.message || err));
     console.error(err);
-  } finally {
-    e.target.value = '';
   }
+}
+
+async function processPDF(file) {
+  if (!window.pdfjsLib) {
+    throw new Error('PDF.js が読み込まれていません');
+  }
+  document.getElementById('ocr-status-text').textContent = 'PDFを読み込み中…';
+  document.getElementById('ocr-progress').style.width = '10%';
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+  // Use page 1 (most common for receipts/invoices). Could iterate later.
+  const page = await pdf.getPage(1);
+
+  // Render to canvas at 2x scale for OCR fidelity
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  document.getElementById('ocr-status-text').textContent = 'PDFを描画中…';
+  document.getElementById('ocr-progress').style.width = '30%';
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  const imageDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  document.getElementById('receipt-preview').src = imageDataUrl;
+
+  // Try to extract embedded text first (text-based PDFs)
+  document.getElementById('ocr-status-text').textContent = 'テキストを抽出中…';
+  document.getElementById('ocr-progress').style.width = '60%';
+  let text = '';
+  try {
+    // Aggregate text from all pages for completeness (small PDFs)
+    const maxPages = Math.min(pdf.numPages, 5);
+    let parts = [];
+    for (let i = 1; i <= maxPages; i++) {
+      const p = i === 1 ? page : await pdf.getPage(i);
+      const tc = await p.getTextContent();
+      // Group items by approximate Y to preserve line breaks
+      const lines = {};
+      for (const it of tc.items) {
+        if (!it.str) continue;
+        const y = Math.round((it.transform ? it.transform[5] : 0) / 4) * 4;
+        if (!lines[y]) lines[y] = [];
+        lines[y].push(it.str);
+      }
+      const ys = Object.keys(lines).map(Number).sort((a, b) => b - a);
+      parts.push(ys.map(y => lines[y].join(' ')).join('\n'));
+    }
+    text = parts.join('\n');
+  } catch (e) {
+    text = '';
+  }
+
+  // If embedded text is too sparse, fall back to OCR on rendered image
+  const stripped = text.replace(/\s/g, '');
+  if (stripped.length < 20) {
+    document.getElementById('ocr-status-text').textContent = '画像化してOCR中…';
+    document.getElementById('ocr-progress').style.width = '70%';
+    text = await runOCR(imageDataUrl);
+  }
+  document.getElementById('ocr-progress').style.width = '100%';
+  return { imageDataUrl, text };
 }
 
 function fileToCompressedDataUrl(file, maxSide = 1200, quality = 0.85) {
